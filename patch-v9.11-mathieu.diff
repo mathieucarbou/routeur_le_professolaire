@@ -1,0 +1,299 @@
+--- routeur_le_professolaire_v9.11/routeur_le_professolaire_v9.11.ino	2023-08-24 08:58:17.779000000 +0200
++++ routeur_le_professolaire_v9.11_mathieu/routeur_le_professolaire_v9.11_mathieu.ino	2023-09-01 00:20:38.243130355 +0200
+@@ -33,6 +33,9 @@
+ byte MnOn=30;                                                  // minute début marche forcée
+ byte SecOn=00;                                                 // sec début marche forcée
+ int temperatureEau = 50;                                       // réglage de la température minimale de l'eau en marche forcée, exemple 50 degrés
++boolean readPower2FromMQTT = true;                             // lit le surplus via mqtt
++boolean mqttRetainFlag = false;
++int routerEnabled = 1;
+ 
+ ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+@@ -53,6 +56,7 @@
+ #include <NTPClient.h> // gestion de l'heure https://github.com/arduino-libraries/NTPClient //
+ #include <OneWire.h> // pour capteur de température DS18B20
+ #include <DallasTemperature.h> // pour capteur de température DS18B20 https://github.com/milesburton/Arduino-Temperature-Control-Library
++#include <esp32DHT.h> // https://github.com/bertmelis/esp32DHT
+ #include <ArduinoOTA.h> // mise à jour OTA par wifi
+ 
+ 
+@@ -71,6 +75,12 @@
+ 
+ // configuration MQTT Home Assistant //
+ 
++#define topic_restart "mosquitto/restart"
++#define topic_uptime "mosquitto/uptime"
++#define topic_enable "mosquitto/enable"
++#define topic_enable_set "mosquitto/enable/set"
++#define topic_power2_set "mosquitto/power2/set"
++#define topic_surplus "mosquitto/surplus"
+ #define topic "mosquitto/power1"
+ #define will_topic "mosquitto/power1/state"
+ #define will_msg "Wemos Sel Deconnecté"
+@@ -118,11 +128,15 @@
+ byte SecOff;                                                   // sec fin marche forcée
+ char mn00Off[2];                                               // affichage des mns fin marche forcée au format 0
+ int temperatureC;                                              // temperature ballon
++float routeurTemp;                                             
++float routeurHumid;
+ unsigned long currentTime=0;
+ unsigned long previousTime1=0;                                 // temporisation relai sortie 3
+ unsigned long previousTime2=0;                                 // temporisation mqqt
+ unsigned long previousTime3=0;                                 // affichage alterné kWh J / kWh total
+ unsigned long previousTime4=0;                                 // demande de température au capteur
++unsigned long lastJSYRead = 0;
++unsigned long mqttPublishIntervall = 3000;
+ 
+ ///  configuration wifi ///
+ 
+@@ -130,7 +144,12 @@
+ WiFiClient espClient;
+ PubSubClient client(espClient);
+ ESPDash dashboard(&server);
++Card onoffButton(&dashboard, BUTTON_CARD, "ON / OFF");
+ Card button(&dashboard, BUTTON_CARD, "Auto / Marche forcée");
++Card restartButton(&dashboard, BUTTON_CARD, "Restart");
++Card uptimeCard(&dashboard, GENERIC_CARD, "uptime", "s");
++Card tempCard(&dashboard, GENERIC_CARD, "température routeur", "°C");
++Card humidCard(&dashboard, GENERIC_CARD, "humidité  routeur", "%");
+ Card consommationsurplus(&dashboard, GENERIC_CARD, "surplus / consommation", "watts");
+ Card puissance(&dashboard, GENERIC_CARD, "puissance envoyée au ballon", "watts");
+ Card energy1(&dashboard, GENERIC_CARD, "énergie sauvée totale", "kwh");
+@@ -153,10 +172,42 @@
+ 
+ OneWire oneWire(oneWireBus); // instance de communication avec le capteur de température
+ DallasTemperature sensors(&oneWire); // correspondance entreoneWire et le capteur Dallas de température
++DHT22 dht;
+ 
+ dimmerLamp dimmer1(pulsePin1, zeroCrossPin);
+ dimmerLamp dimmer2(pulsePin2, zeroCrossPin);
+ 
++unsigned long lastPowerTime;
++void callback(char* topicName, byte* payload, unsigned int length) {
++  if (mqtt && readPower2FromMQTT) {
++    String topicStr = String(topicName);
++    if (topicStr == topic_power2_set) {
++      String data = String(payload, length);
++      ajustePuissance = Power2 = data.toInt();
++      lastPowerTime = millis();
++    } else if (topicStr == topic_enable_set) {
++      String data = String(payload, length);
++      routerEnabled = data.toInt();
++      onoffButton.update(routerEnabled);
++      if (!routerEnabled) {
++        valDim1 = 0;
++        digitalWrite(Relay1, LOW);
++        digitalWrite(Relay2, LOW);
++        dimmer1.setState(OFF);
++        dimmer1.setPower(valDim1);
++        valdim1.update(valDim1);
++        valDim2 = 0;
++        dimmer2.setState(OFF);
++        dimmer2.setPower(valDim2);
++        valdim2.update(valDim2);
++      }
++      dashboard.sendUpdates();
++    } else if(topicStr == topic_restart) {
++      ESP.restart();
++    }
++  }
++}
++
+ void setup() {
+ 
+   Serial.begin(115200);
+@@ -169,9 +220,15 @@
+   WiFi.begin(ssid, password);
+   server.begin();
+   client.setServer(mqtt_server, 1883);
++  client.setCallback(callback);
+   delay(100);
+   temps.begin(); //Intialisation du client NTP
+   sensors.begin(); // initialisation du capteur DS18B20
++  dht.setup(5);
++  dht.onData([](float humid, float temp) {
++    routeurTemp = temp;
++    routeurHumid = humid;
++  });
+   pinMode(Relay1,OUTPUT);
+   pinMode(Relay2,OUTPUT);
+   initOTA(); // initialisation OTA Wifi
+@@ -210,6 +267,9 @@
+     
+     if (client.connect(probe_name, mqtt_user, mqtt_password, will_topic, will_qos, will_retain, will_msg)) 
+       {
++        client.subscribe(topic_power2_set);
++        client.subscribe(topic_enable_set);
++        client.subscribe(topic_restart);
+         break;
+       } 
+     vTaskDelay(500 / portTICK_PERIOD_MS );
+@@ -368,18 +428,35 @@
+ Sens2 = ByteData[9];     // Sens 2
+ Frequency = ByteData[8] * 0.01;     // Fréquence
+ Intensite2 = ByteData[10] * 0.0001;     // Intensité 2
+-Power2 = ByteData[11] * 0.0001;     // Puissance 2
+-Energy2 = ByteData[12] * 0.0001;     // Energie 2
+-
+-if (Sens2 == 1)
+-   { ajustePuissance = -Power2;
+-   }
+-
+-if (Sens2 == 0)
+-   { ajustePuissance = Power2;
+-   }
++Energy2 = ByteData[12] * 0.0001; // Energie 2
+ 
++if(millis() - lastJSYRead >= 2000) 
++{
++  Serial.println(String("Power1: ") + Power1 + ", Intensite1: " + Intensite1 + ", Sens1: " + Sens1 + ", Power2: " + Power2 + ", Intensite2: " + Intensite2 + ", Sens2: " + Sens2 + ", Voltage: " + Voltage + ", Frequency: " + Frequency);
++  lastJSYRead = millis();
++}
+ 
++if (mqtt && readPower2FromMQTT)
++{
++  unsigned long now = millis();
++  if (now - lastPowerTime >= 120000)
++  { // 2 mins
++    ajustePuissance = Power2 = 0;
++    lastPowerTime = now;
++  }
++}
++else
++{
++  Power2 = ByteData[11] * 0.0001; // Puissance 2
++  if (Sens2 == 1)
++  {
++    ajustePuissance = -Power2;
++  }
++  if (Sens2 == 0)
++  {
++    ajustePuissance = Power2;
++  }
++}
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////
+ 
+@@ -394,6 +471,13 @@
+ 
+ currentTime=millis();
+ 
++if(!routerEnabled) {
++  if(Auto == 1) {
++    Datas();
++  }
++  continue;
++}
++
+ ///////////////////////////////////////////////////////////////////////////
+ if ( Auto == 0 )
+     { 
+@@ -595,10 +679,12 @@
+ ////////////////////////MARCHE FORCEE AUTOMATIQUE PAR TEMPERATURE //////////////////////////////
+ //////////////////////////////////////////////////////////////////////////////////////////////// 
+ 
+-if ( marcheForceeTemperature == 1 && currentTime-previousTime4 >= 1000) 
++if (currentTime-previousTime4 >= 1000) 
+         {
+ sensors.requestTemperatures();                          // demande de température au capteur //
+ temperatureC = sensors.getTempCByIndex(0);              // température en degrés Celcius
++dht.read();
++
+ previousTime4=currentTime;
+         }
+ 
+@@ -613,31 +699,34 @@
+ 
+ 
+ // Mosquitto //
+-if ( marcheForceeTemperature == 1 && currentTime - previousTime2 >= 1000 )
++bool publish = false;
++if ( marcheForceeTemperature == 1 && currentTime - previousTime2 >= mqttPublishIntervall )
+    {
+-   client.loop();
+-    if (!client.connected() && mqtt == 1 ) 
+-      {
+-      reconnect();
+-      previousTime2 = currentTime;
+-      }
+   jsontomqtt = "{\"consommation\": " + String(ajustePuissance) +" ,\"surplus\": " + String(Power1) +" , \"energie\": " + String(Energy1) +" , \"energytoday\": " + String(EnergyJ) +" , \"temperature\": " + String(temperatureC) +" }";  //
+-  client.publish(topic, (char*) jsontomqtt.c_str(), true);
++  publish = true;
+    }
+ 
+-if ( marcheForceeTemperature == 0 && currentTime - previousTime2 >= 1000 )
++if ( marcheForceeTemperature == 0 && currentTime - previousTime2 >= mqttPublishIntervall )
+    {
+-   client.loop();
+-    if (!client.connected() && mqtt == 1 ) 
+-    {
+-      reconnect();
+-      previousTime2 = currentTime;
+-
+-    }
++   
+   jsontomqtt = "{\"consommation\": " + String(ajustePuissance) +" ,\"surplus\": " + String(Power1) +" , \"energie\": " + String(Energy1) +" , \"energytoday\": " + String(EnergyJ) +" }";  //
+-  client.publish(topic, (char*) jsontomqtt.c_str(), true);
++  publish = true;
+    }
+ 
++if(publish) 
++{
++  client.loop();
++  if (!client.connected() && mqtt == 1 ) 
++  {
++    reconnect();
++  }
++  client.publish(topic, (char*) jsontomqtt.c_str(), mqttRetainFlag);
++  client.publish(topic_enable, String(routerEnabled).c_str(), mqttRetainFlag);
++  client.publish(topic_uptime, String(millis() / 1000).c_str(), mqttRetainFlag);
++  client.publish(topic_surplus, String(ajustePuissance - Power1).c_str(), mqttRetainFlag);
++  previousTime2 = currentTime;
++}
++
+ ///  affichage heure ///
+ 
+   //Update de l'heure  
+@@ -657,6 +746,11 @@
+         valdim1.update(valDim1);
+         valdim2.update(valDim2);
+         button.update(Auto);
++        onoffButton.update(routerEnabled);
++        uptimeCard.update((int) (millis() / 1000));
++        tempCard.update(routeurTemp);
++        humidCard.update(routeurHumid);
++
+         vTaskDelay(60 / portTICK_PERIOD_MS );
+         dashboard.sendUpdates();
+ 
+@@ -668,6 +762,29 @@
+   dashboard.sendUpdates();
+   });
+  
++  onoffButton.attachCallback([&](bool value){
++    routerEnabled = value;
++    onoffButton.update(routerEnabled);
++    if (!routerEnabled) {
++      valDim1 = 0;
++      digitalWrite(Relay1, LOW);
++      digitalWrite(Relay2, LOW);
++      dimmer1.setState(OFF);
++      dimmer1.setPower(valDim1);
++      valdim1.update(valDim1);
++      valDim2 = 0;
++      dimmer2.setState(OFF);
++      dimmer2.setPower(valDim2);
++      valdim2.update(valDim2);
++    }
++    dashboard.sendUpdates();
++  });
++
++  restartButton.attachCallback([&](bool value){
++    ESP.restart();
++    dashboard.sendUpdates();
++  });
++ 
+ ////////////////////////////////////////////////////////////////////////////
+ //////////////////////////// affichage écran ///////////////////////////////
+ ////////////////////////////////////////////////////////////////////////////

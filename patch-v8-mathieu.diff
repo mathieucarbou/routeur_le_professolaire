@@ -1,0 +1,231 @@
+--- routeur_le_professolaire_v8.03/routeur_le_professolaire_v8.03.ino	2023-08-03 18:32:02.601122485 +0200
++++ routeur_le_professolaire_v8.03_mathieu/routeur_le_professolaire_v8.03_mathieu.ino	2023-08-03 18:32:02.600206071 +0200
+@@ -32,6 +32,9 @@
+ byte MnOn=30;                                                  // minute début marche forcée
+ byte SecOn=00;                                                 // sec début marche forcée
+ int temperatureEau = 50;                                       // réglage de la température minimale de l'eau en marche forcée, exemple 50 degrés
++boolean readPower2FromMQTT = true;                             // lit le surplus via mqtt
++boolean mqttRetainFlag = false;
++int routerEnabled = 1;
+ 
+ ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+@@ -70,6 +73,11 @@
+ 
+ // configuration MQTT Home Assistant //
+ 
++#define topic_restart "mosquitto/restart"
++#define topic_uptime "mosquitto/uptime"
++#define topic_enable "mosquitto/enable"
++#define topic_enable_set "mosquitto/enable/set"
++#define topic_power2_set "mosquitto/power2/set"
+ #define topic "mosquitto/power1"
+ #define will_topic "mosquitto/power1/state"
+ #define will_msg "connected"
+@@ -130,7 +138,10 @@
+ WiFiClient espClient;
+ PubSubClient client(espClient);
+ ESPDash dashboard(&server);
++Card onoffButton(&dashboard, BUTTON_CARD, "ON / OFF");
+ Card button(&dashboard, BUTTON_CARD, "Auto / Marche forcée");
++Card restartButton(&dashboard, BUTTON_CARD, "Restart");
++Card uptimeCard(&dashboard, GENERIC_CARD, "uptime", "s");
+ Card consommationsurplus(&dashboard, GENERIC_CARD, "surplus / consommation", "watts");
+ Card puissance(&dashboard, GENERIC_CARD, "puissance envoyée au ballon", "watts");
+ Card energy1(&dashboard, GENERIC_CARD, "énergie sauvée totale", "kwh");
+@@ -157,6 +168,35 @@
+ dimmerLamp dimmer1(pulsePin1, zeroCrossPin);
+ dimmerLamp dimmer2(pulsePin2, zeroCrossPin);
+ 
++unsigned long lastPowerTime;
++void callback(char* topicName, byte* payload, unsigned int length) {
++  if (mqtt && readPower2FromMQTT) {
++    String topicStr = String(topicName);
++    if (topicStr == topic_power2_set) {
++      String data = String(payload, length);
++      ajustePuissance = Power2 = data.toInt();
++      lastPowerTime = millis();
++    } else if (topicStr == topic_enable_set) {
++      String data = String(payload, length);
++      routerEnabled = data.toInt();
++      onoffButton.update(routerEnabled);
++      if (!routerEnabled) {
++        valDim1 = 0;
++        dimmer1.setState(OFF);
++        dimmer1.setPower(valDim1);
++        valdim1.update(valDim1);
++        valDim2 = 0;
++        dimmer2.setState(OFF);
++        dimmer2.setPower(valDim2);
++        valdim2.update(valDim2);
++      }
++      dashboard.sendUpdates();
++    } else if(topicStr == topic_restart) {
++      ESP.restart();
++    }
++  }
++}
++
+ void setup() {
+ 
+   Serial.begin(115200);
+@@ -169,6 +209,7 @@
+   WiFi.begin(ssid, password);
+   server.begin();
+   client.setServer(mqtt_server, 1883);
++  client.setCallback(callback);
+   delay(100);
+   temps.begin(); //Intialisation du client NTP
+   sensors.begin(); // initialisation du capteur DS18B20
+@@ -211,6 +252,9 @@
+       {
+     //    Serial.println("MQTT OK");
+         //client.publish(will_topic, hello_msg);
++        client.subscribe(topic_power2_set);
++        client.subscribe(topic_enable_set);
++        client.subscribe(topic_restart);
+         break;
+       } 
+    // Serial.print("failed, rc=");
+@@ -306,7 +350,6 @@
+ void Datas ()
+ {
+ 
+-delay (60);
+ 
+ byte msg[] = {0x01,0x03,0x00,0x48,0x00,0x0E,0x44,0x18};
+ 
+@@ -373,16 +416,23 @@
+ Sens2 = ByteData[9];     // Sens 2
+ Frequency = ByteData[8] * 0.01;     // Fréquence
+ Intensite2 = ByteData[10] * 0.0001;     // Intensité 2
+-Power2 = ByteData[11] * 0.0001;     // Puissance 2
+-Energy2 = ByteData[12] * 0.0001;     // Energie 2
+-
+-if (Sens2 == 1)
++if (mqtt && readPower2FromMQTT) {
++  unsigned long now = millis();
++  if (now - lastPowerTime >= 120000) { // 2 mins
++    Power2 = 0;
++    lastPowerTime = now;
++  }
++} else {
++  Power2 = ByteData[11] * 0.0001;     // Puissance 2
++  if (Sens2 == 1)
+    { ajustePuissance = -Power2;
+    }
+ 
+-if (Sens2 == 0)
++  if (Sens2 == 0)
+    { ajustePuissance = Power2;
+    }
++}
++Energy2 = ByteData[12] * 0.0001;     // Energie 2
+ 
+ 
+ 
+@@ -391,6 +441,24 @@
+ 
+ }
+ 
++void ReadJSY() {
++  // 1 pause puis 1 lecture
++  // delay(60);
++  // Data();
++
++  // 1 pause 20ms + lecture pendant 40ms
++  delay(20);
++  const unsigned long end = millis() + 40;
++  Datas();
++  for(unsigned int reads = 1; millis() < end; reads++) {
++    int mPower1 = Power1;
++    int mPower2 = Power2;
++    Datas();
++    Power1 = (mPower1 * reads + Power1) / (reads + 1);
++    Power2 = (mPower2 * reads + Power2) / (reads + 1);
++  }
++}
++
+ //programme utilisant le Core 1 de l'ESP32//
+ 
+ void Task1code( void * pvParameters )
+@@ -398,7 +466,12 @@
+ for(;;) {
+ 
+ 
+-
++if(!routerEnabled) {
++  if(Auto == 1) {
++    ReadJSY();
++  }
++  continue;
++}
+ 
+ ///////////////////////////////////////////////////////////////////////////
+ if ( Auto == 0 )
+@@ -433,7 +506,7 @@
+ if ( Auto == 1 )
+     {
+       pinMode(Relay2,INPUT);
+-      Datas ();
++      ReadJSY ();
+ 
+ 
+ // calcul triacs ///
+@@ -622,7 +695,7 @@
+ 
+  if ( Start == 1 )
+       {
+-        Datas();
++        ReadJSY();
+         EnergyInit = Energy1;
+         Start = 0;
+       }
+@@ -649,7 +722,9 @@
+       reconnect();
+     }
+   jsontomqtt = "{\"surplus\": " + String(Power1) +" , \"energie\": " + String(Energy1) +" , \"energytoday\": " + String(EnergyJ) +" , \"temperature\": " + String(temperatureC) +"}";
+-  client.publish(topic, (char*) jsontomqtt.c_str(), true);
++  client.publish(topic, (char*) jsontomqtt.c_str(), mqttRetainFlag);
++  client.publish(topic_enable, String(routerEnabled).c_str(), mqttRetainFlag);
++  client.publish(topic_uptime, String(millis() / 1000).c_str(), mqttRetainFlag);
+ 
+ 
+ ///  affichage heure ///
+@@ -672,6 +747,8 @@
+         valdim1.update(valDim1);
+         valdim2.update(valDim2);
+         button.update(Auto);
++        onoffButton.update(routerEnabled);
++        uptimeCard.update((int) (millis() / 1000));
+   
+         dashboard.sendUpdates();
+ 
+@@ -682,6 +759,27 @@
+   button.update(Auto);
+   dashboard.sendUpdates();
+   });
++
++  onoffButton.attachCallback([&](bool value){
++    routerEnabled = value;
++    onoffButton.update(routerEnabled);
++    if (!routerEnabled) {
++      valDim1 = 0;
++      dimmer1.setState(OFF);
++      dimmer1.setPower(valDim1);
++      valdim1.update(valDim1);
++      valDim2 = 0;
++      dimmer2.setState(OFF);
++      dimmer2.setPower(valDim2);
++      valdim2.update(valDim2);
++    }
++    dashboard.sendUpdates();
++  });
++
++  restartButton.attachCallback([&](bool value){
++    ESP.restart();
++    dashboard.sendUpdates();
++  });
+  
+ ////////////////////////////////////////////////////////////////////////////
+ //////////////////////////// affichage écran ///////////////////////////////
