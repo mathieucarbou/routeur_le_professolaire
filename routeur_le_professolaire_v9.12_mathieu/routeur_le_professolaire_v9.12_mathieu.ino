@@ -180,50 +180,48 @@ dimmerLamp dimmer2(pulsePin2, zeroCrossPin);
 
 unsigned long lastPowerTime;
 void callback(char* topicName, byte* payload, unsigned int length) {
-  if (mqtt && readPower2FromMQTT) {
-    String topicStr = String(topicName);
-    
-    if (topicStr == topic_power2_set) {
-      String data = String(payload, length);
-      ajustePuissance = Power2 = data.toInt();
-      Serial.println(String("Set Power2=") + Power2);
-      lastPowerTime = millis();
+  String topicStr = String(topicName);
+  
+  if (topicStr == topic_power2_set && readPower2FromMQTT) {
+    String data = String(payload, length);
+    ajustePuissance = Power2 = data.toInt();
+    Serial.println(String("Set Power2=") + Power2);
+    lastPowerTime = millis();
 
-    } else if (topicStr == topic_mf_override) {
-      mfOverride = String(payload, length) == "true";
-      Serial.println(String("MF Override=") + mfOverride);
-    
-    } else if (topicStr == topic_enable_set) {
-      String data = String(payload, length);
-      routerEnabled = data.toInt();
-      Serial.println(String("Router Enabled: ") + routerEnabled);
-      onoffButton.update(routerEnabled);
-      if (!routerEnabled) {
-        valDim1 = 0;
-        digitalWrite(Relay1, LOW);
-        digitalWrite(Relay2, LOW);
-        dimmer1.setState(OFF);
-        dimmer1.setPower(valDim1);
-        valdim1.update(valDim1);
-        valDim2 = 0;
-        dimmer2.setState(OFF);
-        dimmer2.setPower(valDim2);
-        valdim2.update(valDim2);
-      }
-      dashboard.sendUpdates();
-    
-    } else if (topicStr == topic_dimmer_override) {
-      String data = String(payload, length);
-      int val = data.toInt();
-      if(val < 0) dimmerOverride = -1;
-      else if(val > 100) dimmerOverride = 100;
-      else dimmerOverride = val;
-      Serial.println(String("Dimmer1 override: ") + dimmerOverride);
-
-    } else if(topicStr == topic_restart) {
-      Serial.println(String("Restart!"));
-      ESP.restart();
+  } else if (topicStr == topic_mf_override) {
+    mfOverride = String(payload, length) == "true";
+    Serial.println(String("MF Override=") + mfOverride);
+  
+  } else if (topicStr == topic_enable_set) {
+    String data = String(payload, length);
+    routerEnabled = data.toInt();
+    Serial.println(String("Router Enabled: ") + routerEnabled);
+    onoffButton.update(routerEnabled);
+    if (!routerEnabled) {
+      valDim1 = 0;
+      digitalWrite(Relay1, LOW);
+      digitalWrite(Relay2, LOW);
+      dimmer1.setState(OFF);
+      dimmer1.setPower(valDim1);
+      valdim1.update(valDim1);
+      valDim2 = 0;
+      dimmer2.setState(OFF);
+      dimmer2.setPower(valDim2);
+      valdim2.update(valDim2);
     }
+    dashboard.sendUpdates();
+  
+  } else if (topicStr == topic_dimmer_override) {
+    String data = String(payload, length);
+    int val = data.toInt();
+    if(val < 0) dimmerOverride = -1;
+    else if(val > 100) dimmerOverride = 100;
+    else dimmerOverride = val;
+    Serial.println(String("Dimmer1 override: ") + dimmerOverride);
+
+  } else if(topicStr == topic_restart) {
+    Serial.println(String("Restart!"));
+    ESP.restart();
   }
 }
 
